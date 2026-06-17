@@ -1,0 +1,826 @@
+# ==============================================================================
+# Galaxy case study: KDE and four DPMM density estimators
+# ------------------------------------------------------------------------------
+# Methods compared (qualitatively):
+#   1. KDE  with Sheather-Jones bandwidth and bootstrap 95% CI
+#   2. DPMM Stan stick-breaking (4 NUTS chains)
+#   3. DPMM NIMBLE collapsed CRP (4 chains)
+#   4. DPMM Walker (2007) slice sampler (4 chains)
+#   5. DPMM Neal (2000) Algorithm 3 (4 chains)
+#
+# Common DPMM model with NIG base measure G_0:
+#     y_i | c_i, mu_k, s2_k  ~ N(mu_{c_i}, s2_{c_i})
+#     s2_k                   ~ IG(a_sigma, b_sigma)
+#     mu_k | s2_k, kappa     ~ N(mu_0, kappa * s2_k)
+#     kappa                  ~ IG(a_kappa, b_kappa)
+#     alpha                  ~ Gamma(alpha_a, alpha_b),  E[alpha] = 1
+# E[K_occ | alpha=1, n=82] = alpha * log(1 + n/alpha) = log(83) ~ 4.4 ~ 5
+#
+# Outputs (under OUT_DIR):
+#     galaxy_densities.png        density estimates + 95% bands
+#     galaxy_K_occ.png            posterior of K_occ for each Bayesian method
+#     galaxy_trace_<method>.png   trace plots for alpha, kappa, K_occ
+#     galaxy_diagnostics.csv      rhat / ess_bulk / ess_tail per (method, param)
+#     galaxy_results.rds          full posterior draws and density bands
+# ==============================================================================
+
+
+# ---- 0. Libraries ------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(rstan)
+  library(nimble)
+  library(MASS)
+  library(ggplot2)
+  library(patchwork)
+  library(posterior)
+  library(bayesplot)
+})
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+OUT_DIR <- "Galaxy_case_study_outputs"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+STAN_FILE <- "Galaxy_DPM.stan"   # the .stan file in the working directory
+
+set.seed(2026)
+
+
+# ---- 1. Data -----------------------------------------------------------------
+data(galaxies, package = "MASS")
+y_data <- log(galaxies)
+N      <- length(y_data)
+
+GRID_LO <- min(y_data) - 0.5
+GRID_HI <- max(y_data) + 0.5
+GRID_N  <- 401
+grid    <- seq(GRID_LO, GRID_HI, length.out = GRID_N)
+
+
+# ---- 2. Config ---------------------------------------------------------------
+CFG <- list(
+  K_TRUNC      = 20,         # stick-breaking truncation (Stan only)
+  N_CHAINS     = 4,
+  N_ITER       = 4000,       # per chain, total including burn
+  N_BURN       = 2000,
+  MU_0         = mean(y_data),
+
+  # Inverse-Gamma on component variance
+  A_SIGMA = 5, B_SIGMA = 0.01,                      # E[s2_k] = 0.05
+
+  # Inverse-Gamma on kappa (spread of cluster means)
+  A_KAPPA = 5, B_KAPPA = 12,                       # E[kappa] = 3
+
+  # Gamma on concentration; alpha_a = alpha_b = 2 gives E[alpha] = 1.
+  ALPHA_SHAPE = 2, ALPHA_RATE = 2,
+
+  B_BOOT = 1000
+)
+KEEP_PER_CHAIN <- CFG$N_ITER - CFG$N_BURN
+N_KEEP_TOTAL   <- KEEP_PER_CHAIN * CFG$N_CHAINS
+
+cat("\nGalaxy case study\n")
+cat("  n = ", N, "\n")
+cat("  E[alpha] = ", CFG$ALPHA_SHAPE / CFG$ALPHA_RATE, "\n")
+cat("  E[K_occ] given E[alpha]=1 and n=", N,
+    " is approx alpha * log(1+n/alpha) = ", log(1 + N), "\n", sep = "")
+
+
+# ---- 3. Generic helpers ------------------------------------------------------
+mix_density <- function(grid, weights, means, sds) {
+  out <- numeric(length(grid))
+  for (k in seq_along(weights))
+    out <- out + weights[k] * dnorm(grid, means[k], sds[k])
+  out
+}
+
+# Mean + pointwise 95% interval on a draws_matrix where each row is a draw
+# of f on the grid.
+summarise_density_draws <- function(dens_mat) {
+  data.frame(
+    x     = grid,
+    mean  = colMeans(dens_mat),
+    lower = apply(dens_mat, 2, quantile, probs = 0.025),
+    upper = apply(dens_mat, 2, quantile, probs = 0.975)
+  )
+}
+
+
+# ---- 4. KDE with bootstrap CI ------------------------------------------------
+# Sheather-Jones bandwidth on the original sample; for each bootstrap resample
+# we recompute the bandwidth so the CI reflects both density and bandwidth
+# uncertainty.
+kde_on_grid <- function(y) {
+  bw  <- tryCatch(bw.SJ(y), error = function(e) bw.nrd0(y))
+  d   <- density(y, bw = bw, from = GRID_LO, to = GRID_HI, n = 1024)
+  approx(d$x, d$y, xout = grid, rule = 2)$y
+}
+
+cat("\n--- KDE + bootstrap (", CFG$B_BOOT, " resamples) ---\n", sep = "")
+fhat_kde_point <- kde_on_grid(y_data)
+boot_mat <- matrix(0, CFG$B_BOOT, GRID_N)
+for (b in seq_len(CFG$B_BOOT)) {
+  boot_mat[b, ] <- kde_on_grid(sample(y_data, N, replace = TRUE))
+}
+kde_band <- summarise_density_draws(boot_mat)
+kde_band$mean <- fhat_kde_point   # report point estimate as mean of original sample
+
+
+# ---- 5. Stan stick-breaking DPMM ---------------------------------------------
+cat("\n--- Stan stick-breaking DPMM ---\n")
+
+stan_data <- list(
+  K = CFG$K_TRUNC, N = N, y = y_data,
+  a_sigma = CFG$A_SIGMA, b_sigma = CFG$B_SIGMA,
+  mu_0    = CFG$MU_0,
+  a_kappa = CFG$A_KAPPA, b_kappa = CFG$B_KAPPA,
+  alpha_a = CFG$ALPHA_SHAPE, alpha_b = CFG$ALPHA_RATE
+)
+
+stan_t0 <- Sys.time()
+fit_stan <- stan(
+  file    = STAN_FILE,
+  data    = stan_data,
+  chains  = CFG$N_CHAINS,
+  warmup  = CFG$N_BURN,
+  iter    = CFG$N_ITER,
+  cores   = CFG$N_CHAINS,
+  refresh = 0,
+  control = list(adapt_delta = 0.97, max_treedepth = 12)
+)
+stan_runtime <- as.numeric(difftime(Sys.time(), stan_t0, units = "secs"))
+
+# Density-construction draws can be permuted (we only need the mixture-mean).
+pi_mat    <- rstan::extract(fit_stan, "pi_var")$pi_var
+mu_mat    <- rstan::extract(fit_stan, "mu")$mu
+sigma_mat <- rstan::extract(fit_stan, "sigma")$sigma
+S_stan    <- nrow(pi_mat)
+
+dens_stan <- matrix(0, S_stan, GRID_N)
+for (s in seq_len(S_stan))
+  dens_stan[s, ] <- mix_density(grid, pi_mat[s, ], mu_mat[s, ], sigma_mat[s, ])
+stan_band <- summarise_density_draws(dens_stan)
+
+# Diagnostics MUST preserve chain structure (R-hat requires it).
+# as.array(fit, pars = ...) returns dim [iter x chain x param].
+# as.vector() unrolls column-major, so the result is
+#   [chain1 iter1..N, chain2 iter1..N, ...]
+# which matches the make_draws_array() indexing below.
+stan_diag_arr <- as.array(fit_stan, pars = c("alpha", "kappa", "K_occ"))
+alpha_stan <- as.vector(stan_diag_arr[, , "alpha"])
+kappa_stan <- as.vector(stan_diag_arr[, , "kappa"])
+K_occ_stan <- as.vector(stan_diag_arr[, , "K_occ"])
+
+
+# ---- 6. NIMBLE CRP DPMM ------------------------------------------------------
+cat("\n--- NIMBLE CRP DPMM ---\n")
+
+nimble_code <- nimbleCode({
+  for (i in 1:n) {
+    y[i]    ~ dnorm(mu_i[i], sd = sqrt(s2_i[i]))
+    mu_i[i] <- muTilde[xi[i]]
+    s2_i[i] <- s2Tilde[xi[i]]
+  }
+  xi[1:n] ~ dCRP(alpha, size = n)
+  for (i in 1:n) {
+    muTilde[i] ~ dnorm(mu_0, sd = sqrt(kappa * s2Tilde[i]))
+    s2Tilde[i] ~ dinvgamma(a_sigma, b_sigma)
+  }
+  kappa ~ dinvgamma(a_kappa, b_kappa)
+  alpha ~ dgamma(shape = alpha_a, rate = alpha_b)
+})
+
+nim_consts <- list(
+  n = N,
+  a_sigma = CFG$A_SIGMA, b_sigma = CFG$B_SIGMA,
+  mu_0    = CFG$MU_0,
+  a_kappa = CFG$A_KAPPA, b_kappa = CFG$B_KAPPA,
+  alpha_a = CFG$ALPHA_SHAPE, alpha_b = CFG$ALPHA_RATE
+)
+nim_inits <- list(
+  xi      = rep(1L, N),
+  muTilde = rnorm(N, CFG$MU_0, 0.1),
+  s2Tilde = 1 / rgamma(N, CFG$A_SIGMA, CFG$B_SIGMA),
+  kappa   = 1 / rgamma(1, CFG$A_KAPPA, CFG$B_KAPPA),
+  alpha   = max(0.1, CFG$ALPHA_SHAPE / CFG$ALPHA_RATE)
+)
+
+rModel <- nimbleModel(nimble_code, constants = nim_consts,
+                      data = list(y = y_data), inits = nim_inits)
+cModel <- compileNimble(rModel)
+conf   <- configureMCMC(rModel,
+            monitors = c("xi", "muTilde", "s2Tilde", "alpha", "kappa"))
+mcmc_r <- buildMCMC(conf)
+cmcmc  <- compileNimble(mcmc_r, project = cModel)
+
+nim_t0 <- Sys.time()
+samples_nim <- runMCMC(cmcmc,
+                       niter   = CFG$N_ITER,
+                       nburnin = CFG$N_BURN,
+                       nchains = CFG$N_CHAINS,
+                       samples = TRUE, summary = FALSE,
+                       progressBar = FALSE,
+                       samplesAsCodaMCMC = FALSE)
+nim_runtime <- as.numeric(difftime(Sys.time(), nim_t0, units = "secs"))
+
+# samples_nim is a list of matrices, one per chain
+chain_to_dens <- function(samples) {
+  S  <- nrow(samples)
+  alpha_s <- samples[, "alpha"]
+  kappa_s <- samples[, "kappa"]
+  xi_mat  <- samples[, grep("^xi\\[",      colnames(samples))]
+  mu_mat  <- samples[, grep("^muTilde\\[", colnames(samples))]
+  s2_mat  <- samples[, grep("^s2Tilde\\[", colnames(samples))]
+
+  K_occ_v <- apply(xi_mat, 1, function(xs) length(unique(xs)))
+  dens    <- matrix(0, S, GRID_N)
+  for (s in seq_len(S)) {
+    xi_s   <- xi_mat[s, ]
+    occ    <- sort(unique(xi_s))
+    n_k    <- as.integer(table(factor(xi_s, levels = occ)))
+    mu_occ <- mu_mat[s, occ]
+    s2_occ <- s2_mat[s, occ]
+    # Posterior predictive: occupied clusters + draw a fresh cluster from G_0
+    s2_new <- 1 / rgamma(1, CFG$A_SIGMA, CFG$B_SIGMA)
+    mu_new <- rnorm(1, CFG$MU_0, sqrt(kappa_s[s] * s2_new))
+    w      <- c(n_k / (N + alpha_s[s]), alpha_s[s] / (N + alpha_s[s]))
+    m      <- c(mu_occ, mu_new)
+    sd_    <- c(sqrt(s2_occ), sqrt(s2_new))
+    dens[s, ] <- mix_density(grid, w, m, sd_)
+  }
+  list(dens = dens, K_occ = K_occ_v, alpha = alpha_s, kappa = kappa_s)
+}
+
+nim_chains <- lapply(samples_nim, chain_to_dens)
+dens_nim   <- do.call(rbind, lapply(nim_chains, `[[`, "dens"))
+nimble_band <- summarise_density_draws(dens_nim)
+
+K_occ_nim <- unlist(lapply(nim_chains, `[[`, "K_occ"))
+alpha_nim <- unlist(lapply(nim_chains, `[[`, "alpha"))
+kappa_nim <- unlist(lapply(nim_chains, `[[`, "kappa"))
+
+
+# ---- 7. Walker slice sampler -------------------------------------------------
+cat("\n--- Walker slice sampler ---\n")
+
+update_kappa <- function(mu, s2, mu0, a_kappa, b_kappa, occupied) {
+  mu_occ  <- mu[occupied]; s2_occ <- s2[occupied]; K_occ <- length(mu_occ)
+  S_tau   <- sum((mu_occ - mu0)^2 / s2_occ)
+  1 / rgamma(1, shape = a_kappa + K_occ / 2, rate = b_kappa + 0.5 * S_tau)
+}
+
+walker_slice_nig <- function(y, n_iter, n_burn, mu0,
+                             a_sigma, b_sigma, a_kappa, b_kappa,
+                             alpha_shape, alpha_rate) {
+  n <- length(y)
+  rprior_NIG <- function(kappa_cur) {
+    s2 <- 1 / rgamma(1, a_sigma, b_sigma)
+    list(mu = rnorm(1, mu0, sqrt(kappa_cur * s2)), s2 = s2)
+  }
+  kappa <- 1 / rgamma(1, a_kappa, b_kappa)
+  alpha <- rgamma(1, alpha_shape, alpha_rate)
+  d <- rep(1L, n); v <- rbeta(1, 1, alpha); w <- v
+  init <- rprior_NIG(kappa); mu <- init$mu; s2 <- init$s2
+  K <- 1L
+  draws <- vector("list", n_iter)
+
+  for (it in seq_len(n_iter)) {
+    u     <- runif(n, 0, w[d]); u_min <- min(u)
+    while (1 - sum(w) > u_min) {
+      v_new <- rbeta(1, 1, alpha)
+      w <- c(w, v_new * (1 - sum(w))); v <- c(v, v_new)
+      new <- rprior_NIG(kappa); mu <- c(mu, new$mu); s2 <- c(s2, new$s2)
+      K <- K + 1L
+    }
+    for (i in seq_len(n)) {
+      elig <- which(w > u[i])
+      lp   <- dnorm(y[i], mu[elig], sqrt(s2[elig]), log = TRUE)
+      p    <- exp(lp - max(lp))
+      d[i] <- if (length(elig) == 1L) elig else sample(elig, 1, prob = p)
+    }
+    k_star_trim <- max(d)
+    if (K > k_star_trim) {
+      v  <- v[seq_len(k_star_trim)]; w <- w[seq_len(k_star_trim)]
+      mu <- mu[seq_len(k_star_trim)]; s2 <- s2[seq_len(k_star_trim)]
+      K  <- k_star_trim
+    }
+    # alpha update (Escobar-West auxiliary)
+    K_star <- length(unique(d))
+    eta    <- rbeta(1, alpha + 1, n)
+    A_     <- alpha_shape + K_star - 1
+    B_     <- alpha_rate - log(eta)
+    pi_eta <- A_ / (A_ + n * B_)
+    alpha  <- if (runif(1) < pi_eta)
+      rgamma(1, alpha_shape + K_star, B_) else rgamma(1, alpha_shape + K_star - 1, B_)
+    # stick weights via slice-conditional Beta CDF inversion
+    k_star  <- max(d); log_1mv <- log1p(-v); cs <- cumsum(log_1mv); log_u <- log(u)
+    for (j in seq_len(k_star)) {
+      log_prod_lt_j <- if (j == 1L) 0 else cs[j - 1L]
+      idx_eq <- which(d == j)
+      L_j <- if (length(idx_eq)) exp(max(log_u[idx_eq]) - log_prod_lt_j) else 0
+      idx_gt <- which(d > j)
+      if (length(idx_gt)) {
+        ki <- d[idx_gt]
+        log_ratio <- log_u[idx_gt] - log(v[ki]) - (cs[ki - 1L] - log_1mv[j])
+        U_j <- 1 - exp(max(log_ratio))
+      } else U_j <- 1
+      L_j <- max(0, min(1, L_j)); U_j <- max(0, min(1, U_j))
+      if (U_j <= L_j) next
+      A_cdf <- (1 - L_j)^alpha; B_cdf <- (1 - U_j)^alpha
+      xi <- runif(1); v[j] <- 1 - (A_cdf - xi * (A_cdf - B_cdf))^(1 / alpha)
+      log_1mv[j] <- log1p(-v[j]); cs <- cumsum(log_1mv)
+    }
+    w <- v * c(1, cumprod(1 - v[-K]))
+    occupied <- sort(unique(d)); K_occ <- length(occupied)
+    kappa <- update_kappa(mu, s2, mu0, a_kappa, b_kappa, occupied)
+    for (k in seq_len(K)) {
+      idx <- which(d == k); nk <- length(idx)
+      if (nk > 0L) {
+        ybar <- mean(y[idx]); Sk <- sum((y[idx] - ybar)^2)
+        lambda_n <- 1/kappa + nk
+        mu_n     <- (mu0/kappa + nk * ybar) / lambda_n
+        a_n      <- a_sigma + nk / 2
+        b_n      <- b_sigma + 0.5 * Sk + nk * (ybar - mu0)^2 / (2 * (1 + nk * kappa))
+        s2[k] <- 1 / rgamma(1, a_n, b_n)
+        mu[k] <- rnorm(1, mu_n, sqrt(s2[k] / lambda_n))
+      } else {
+        new <- rprior_NIG(kappa); mu[k] <- new$mu; s2[k] <- new$s2
+      }
+    }
+    draws[[it]] <- list(w = w, mu = mu, s2 = s2, K_occ = K_occ,
+                        alpha = alpha, kappa = kappa)
+  }
+  draws[(n_burn + 1):n_iter]
+}
+
+run_walker_chain <- function(seed) {
+  set.seed(seed)
+  dr <- walker_slice_nig(y_data, CFG$N_ITER, CFG$N_BURN, CFG$MU_0,
+                         CFG$A_SIGMA, CFG$B_SIGMA,
+                         CFG$A_KAPPA, CFG$B_KAPPA,
+                         CFG$ALPHA_SHAPE, CFG$ALPHA_RATE)
+  S <- length(dr)
+  dens <- matrix(0, S, GRID_N)
+  K_occ_v <- numeric(S); alpha_v <- numeric(S); kappa_v <- numeric(S)
+  for (s in seq_len(S)) {
+    dens[s, ] <- mix_density(grid, dr[[s]]$w, dr[[s]]$mu, sqrt(dr[[s]]$s2))
+    K_occ_v[s] <- dr[[s]]$K_occ
+    alpha_v[s] <- dr[[s]]$alpha
+    kappa_v[s] <- dr[[s]]$kappa
+  }
+  list(dens = dens, K_occ = K_occ_v, alpha = alpha_v, kappa = kappa_v)
+}
+
+walker_t0 <- Sys.time()
+walker_chains <- lapply(seq_len(CFG$N_CHAINS),
+                        function(c) run_walker_chain(2026 + 100 * c))
+walker_runtime <- as.numeric(difftime(Sys.time(), walker_t0, units = "secs"))
+
+dens_walker   <- do.call(rbind, lapply(walker_chains, `[[`, "dens"))
+walker_band   <- summarise_density_draws(dens_walker)
+K_occ_walker  <- unlist(lapply(walker_chains, `[[`, "K_occ"))
+alpha_walker  <- unlist(lapply(walker_chains, `[[`, "alpha"))
+kappa_walker  <- unlist(lapply(walker_chains, `[[`, "kappa"))
+
+
+# ---- 8. Neal Algorithm 3 -----------------------------------------------------
+cat("\n--- Neal Algorithm 3 ---\n")
+
+neal_alg3_nig <- function(y, n_iter, n_burn, mu0,
+                          a_sigma, b_sigma, a_kappa, b_kappa,
+                          alpha_shape, alpha_rate) {
+  n <- length(y)
+  kappa   <- 1 / rgamma(1, a_kappa, b_kappa)
+  alpha   <- rgamma(1, alpha_shape, alpha_rate)
+  c_alloc <- rep(1L, n); n_k <- as.integer(table(c_alloc)); Nclust <- length(n_k)
+
+  log_marg <- function(y_new, y_c, kappa_cur) {
+    if (length(y_c) == 0L) {
+      df <- 2 * a_sigma; loc <- mu0
+      scale2 <- (b_sigma / a_sigma) * (1 + kappa_cur)
+    } else {
+      nk <- length(y_c); ybar <- mean(y_c); Sk <- sum((y_c - ybar)^2)
+      lambda_n <- 1 / kappa_cur + nk
+      mu_n  <- (mu0 / kappa_cur + nk * ybar) / lambda_n
+      a_n   <- a_sigma + nk / 2
+      b_n   <- b_sigma + 0.5 * Sk + nk * (ybar - mu0)^2 / (2 * (1 + nk * kappa_cur))
+      df <- 2 * a_n; loc <- mu_n
+      scale2 <- (b_n / a_n) * (1 + 1 / lambda_n)
+    }
+    z <- (y_new - loc) / sqrt(scale2)
+    dt(z, df, log = TRUE) - 0.5 * log(scale2)
+  }
+
+  draws <- vector("list", n_iter)
+  for (it in seq_len(n_iter)) {
+    # Allocation
+    for (i in seq_len(n)) {
+      c_i <- c_alloc[i]; n_k[c_i] <- n_k[c_i] - 1L
+      if (n_k[c_i] == 0L) {
+        n_k[c_i] <- n_k[Nclust]
+        c_alloc[c_alloc == Nclust] <- c_i
+        n_k <- n_k[-Nclust]; Nclust <- Nclust - 1L
+      }
+      c_alloc[i] <- -1L
+      logp <- numeric(Nclust + 1L)
+      for (cc in seq_len(Nclust)) {
+        y_c <- y[c_alloc == cc]
+        logp[cc] <- log(n_k[cc]) + log_marg(y[i], y_c, kappa)
+      }
+      logp[Nclust + 1L] <- log(alpha) + log_marg(y[i], numeric(0), kappa)
+      logp  <- logp - max(logp); probs <- exp(logp); probs <- probs / sum(probs)
+      newz  <- sample.int(Nclust + 1L, 1L, prob = probs)
+      if (newz == Nclust + 1L) { n_k <- c(n_k, 0L); Nclust <- Nclust + 1L }
+      c_alloc[i] <- newz; n_k[newz] <- n_k[newz] + 1L
+    }
+    # Instantiate (mu_c, s2_c) for each occupied cluster
+    mu_c <- numeric(Nclust); s2_c <- numeric(Nclust)
+    for (cc in seq_len(Nclust)) {
+      y_c <- y[c_alloc == cc]; nk <- length(y_c)
+      ybar <- mean(y_c); Sk <- sum((y_c - ybar)^2)
+      lambda_n <- 1 / kappa + nk
+      mu_n  <- (mu0 / kappa + nk * ybar) / lambda_n
+      a_n   <- a_sigma + nk / 2
+      b_n   <- b_sigma + 0.5 * Sk + nk * (ybar - mu0)^2 / (2 * (1 + nk * kappa))
+      s2_c[cc] <- 1 / rgamma(1, a_n, b_n)
+      mu_c[cc] <- rnorm(1, mu_n, sqrt(s2_c[cc] / lambda_n))
+    }
+    kappa <- update_kappa(mu_c, s2_c, mu0, a_kappa, b_kappa, seq_len(Nclust))
+    # alpha (Escobar-West)
+    eta <- rbeta(1, alpha + 1, n)
+    A_  <- alpha_shape + Nclust - 1
+    B_  <- alpha_rate - log(eta)
+    pi_eta <- A_ / (A_ + n * B_)
+    alpha  <- if (runif(1) < pi_eta)
+      rgamma(1, alpha_shape + Nclust, B_) else rgamma(1, alpha_shape + Nclust - 1, B_)
+    # Posterior predictive: occupied components + a fresh draw from G_0
+    s2_new <- 1 / rgamma(1, a_sigma, b_sigma)
+    mu_new <- rnorm(1, mu0, sqrt(kappa * s2_new))
+    weights <- c(n_k / (n + alpha), alpha / (n + alpha))
+    means   <- c(mu_c, mu_new)
+    sds     <- c(sqrt(s2_c), sqrt(s2_new))
+    draws[[it]] <- list(weights = weights, means = means, sds = sds,
+                        K_occ = Nclust, alpha = alpha, kappa = kappa)
+  }
+  draws[(n_burn + 1):n_iter]
+}
+
+run_alg3_chain <- function(seed) {
+  set.seed(seed)
+  dr <- neal_alg3_nig(y_data, CFG$N_ITER, CFG$N_BURN, CFG$MU_0,
+                      CFG$A_SIGMA, CFG$B_SIGMA,
+                      CFG$A_KAPPA, CFG$B_KAPPA,
+                      CFG$ALPHA_SHAPE, CFG$ALPHA_RATE)
+  S <- length(dr)
+  dens <- matrix(0, S, GRID_N)
+  K_occ_v <- numeric(S); alpha_v <- numeric(S); kappa_v <- numeric(S)
+  for (s in seq_len(S)) {
+    dens[s, ] <- mix_density(grid, dr[[s]]$weights, dr[[s]]$means, dr[[s]]$sds)
+    K_occ_v[s] <- dr[[s]]$K_occ
+    alpha_v[s] <- dr[[s]]$alpha
+    kappa_v[s] <- dr[[s]]$kappa
+  }
+  list(dens = dens, K_occ = K_occ_v, alpha = alpha_v, kappa = kappa_v)
+}
+
+alg3_t0 <- Sys.time()
+alg3_chains <- lapply(seq_len(CFG$N_CHAINS),
+                      function(c) run_alg3_chain(7777 + 100 * c))
+alg3_runtime <- as.numeric(difftime(Sys.time(), alg3_t0, units = "secs"))
+
+dens_alg3  <- do.call(rbind, lapply(alg3_chains, `[[`, "dens"))
+alg3_band  <- summarise_density_draws(dens_alg3)
+K_occ_alg3 <- unlist(lapply(alg3_chains, `[[`, "K_occ"))
+alpha_alg3 <- unlist(lapply(alg3_chains, `[[`, "alpha"))
+kappa_alg3 <- unlist(lapply(alg3_chains, `[[`, "kappa"))
+
+
+# ---- 9. Density-estimate plot (KDE + 4 DPMM) ---------------------------------
+bands_list <- list(
+  KDE          = kde_band,
+  `DPM-Stan`   = stan_band,
+  `CRP-NIMBLE` = nimble_band,
+  Walker       = walker_band,
+  `Neal Alg.3` = alg3_band
+)
+
+hist_df <- data.frame(y = y_data)
+
+plots <- lapply(names(bands_list), function(nm) {
+  df <- bands_list[[nm]]
+  ggplot(df, aes(x = x)) +
+    geom_histogram(data = hist_df, aes(x = y, y = after_stat(density)),
+                   bins = 50, fill = "grey85", colour = "white",
+                   inherit.aes = FALSE) +
+    geom_ribbon(aes(ymin = lower, ymax = upper),
+                fill = "steelblue", alpha = 0.3) +
+    geom_line(aes(y = mean), colour = "steelblue", linewidth = 0.9) +
+    geom_rug(data = hist_df, aes(x = y), inherit.aes = FALSE,
+             alpha = 0.4, length = unit(0.02, "npc")) +
+    coord_cartesian(xlim = c(GRID_LO + 0.3, GRID_HI - 0.3)) +
+    labs(title = nm, x = "log(velocity)", y = "Density") +
+    theme_minimal(base_size = 11)
+})
+
+library(gridExtra)
+plot_dens <- arrangeGrob(
+  grobs = plots, ncol = 2,
+  top = "Galaxy data: density estimates with 95% intervals")
+grid::grid.newpage(); grid::grid.draw(plot_dens)
+
+ggsave(file.path(OUT_DIR, "galaxy_densities.png"), plot_dens,
+       width = 11, height = 8, dpi = 150)
+print(plot_dens)
+
+
+# ---- 10. Posterior of K_occ --------------------------------------------------
+# Comment: the DPMM is well known to be inconsistent for the *number of clusters*
+# (Miller & Harrison 2013): K_occ does NOT concentrate on the true K. It is
+# better viewed as a smoothing/complexity parameter than as the number of
+# physical components. We expect a posterior mean noticeably larger than the
+# 3-7 modes that Escobar & West (1995) and Roeder (1990) discuss.
+K_occ_list <- list(
+  `DPM-Stan`   = K_occ_stan,
+  `CRP-NIMBLE` = K_occ_nim,
+  Walker       = K_occ_walker,
+  `Neal Alg.3` = K_occ_alg3
+)
+
+cat("\nPosterior of K_occ (DPMM overestimates 'true' number of components):\n")
+K_summary <- do.call(rbind, lapply(names(K_occ_list), function(nm) {
+  x <- K_occ_list[[nm]]
+  data.frame(method = nm, mean = mean(x), median = median(x),
+             q025 = quantile(x, 0.025), q975 = quantile(x, 0.975))
+}))
+print(K_summary, row.names = FALSE, digits = 3)
+
+K_df <- do.call(rbind, lapply(names(K_occ_list), function(nm) {
+  x <- K_occ_list[[nm]]
+  tab <- table(x)
+  data.frame(method = nm,
+             K_occ  = as.integer(names(tab)),
+             prop   = as.numeric(tab) / sum(tab))
+}))
+K_df$method <- factor(K_df$method, levels = names(K_occ_list))
+
+# Per-method mean K_occ, one row per facet
+K_means <- do.call(rbind, lapply(names(K_occ_list), function(nm) {
+  data.frame(method = nm, mean_K = mean(K_occ_list[[nm]]))
+}))
+K_means$method <- factor(K_means$method, levels = names(K_occ_list))
+
+plot_Kocc <- ggplot(K_df, aes(x = K_occ, y = prop)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_vline(data = K_means, aes(xintercept = mean_K),
+             linetype = "dotted", linewidth = 0.7, colour = "red") +
+  geom_text(data = K_means,
+            aes(x = mean_K, y = Inf,
+                label = sprintf("mean = %.2f", mean_K)),
+            hjust = -0.05, vjust = 1.5, size = 3, colour = "grey20",
+            inherit.aes = FALSE) +
+  facet_wrap(~ method, ncol = 2) +
+  scale_x_continuous(breaks = function(lims) seq(floor(lims[1]), ceiling(lims[2]))) +
+  labs(title = expression("Posterior of " * K[occ]),
+       subtitle = "Red dotted line = posterior mean",
+       x = expression(K[occ]), y = "Posterior probability") +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(OUT_DIR, "galaxy_K_occ.png"), plot_Kocc,
+       width = 9, height = 6, dpi = 150)
+print(plot_Kocc)
+
+# ---- 10. Posterior of alpha and kappa --------------------------------------------------
+alpha_list <- list(
+  `DPM-Stan`   = alpha_stan,
+  `CRP-NIMBLE` = alpha_nim,
+  Walker       = alpha_walker,
+  `Neal Alg.3` = alpha_alg3
+)
+
+cat("\nPosterior of alpha:\n")
+alpha_summary <- do.call(rbind, lapply(names(alpha_list), function(nm) {
+  x <- alpha_list[[nm]]
+  data.frame(method = nm, mean = mean(x), median = median(x),
+             q025 = quantile(x, 0.025), q975 = quantile(x, 0.975))
+}))
+print(alpha_summary, row.names = FALSE, digits = 3)
+
+# Prior hyperparameters
+ALPHA_SHAPE <- 2
+ALPHA_RATE  <- 2
+
+# Long-format data frame of raw posterior draws (one row per draw, per method)
+alpha_df <- do.call(rbind, lapply(names(alpha_list), function(nm) {
+  data.frame(method = nm, alpha = as.numeric(alpha_list[[nm]]))
+}))
+alpha_df$method <- factor(alpha_df$method, levels = names(alpha_list))
+
+# Per-method posterior mean of alpha, one row per facet
+alpha_means <- do.call(rbind, lapply(names(alpha_list), function(nm) {
+  data.frame(method = nm, mean_alpha = mean(alpha_list[[nm]]))
+}))
+alpha_means$method <- factor(alpha_means$method, levels = names(alpha_list))
+
+plot_alpha <- ggplot(alpha_df, aes(x = alpha)) +
+  geom_density(aes(colour = "Posterior"),
+               fill = "steelblue", alpha = 0.35, linewidth = 0.7) +
+  stat_function(aes(colour = "Prior"),
+                fun  = dgamma,
+                args = list(shape = ALPHA_SHAPE, rate = ALPHA_RATE),
+                linewidth = 0.7, linetype = "dashed") +
+  geom_vline(data = alpha_means,
+             aes(xintercept = mean_alpha, colour = "Posterior mean"),
+             linetype = "dotted", linewidth = 0.7,
+             show.legend = FALSE) +
+  geom_text(data = alpha_means,
+            aes(x = mean_alpha, y = Inf,
+                label = sprintf("mean = %.2f", mean_alpha)),
+            hjust = -0.05, vjust = 1.5, size = 3, colour = "grey20",
+            inherit.aes = FALSE) +
+  facet_wrap(~ method, ncol = 2) +
+  scale_colour_manual(values = c("Posterior"      = "steelblue",
+                                 "Prior"          = "firebrick",
+                                 "Posterior mean" = "black"),
+                      breaks = c("Posterior", "Prior")) +
+  scale_x_continuous(breaks = function(lims) seq(floor(lims[1]), ceiling(lims[2])))+
+  labs(title    = expression("Posterior of " * alpha),
+       subtitle = sprintf("Prior: Gamma(shape = %g, rate = %g);  red dotted line = posterior mean",
+                          ALPHA_SHAPE, ALPHA_RATE),
+       x        = expression(alpha),
+       y        = "Density",
+       colour   = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(OUT_DIR, "galaxy_alpha.png"), plot_alpha,
+       width = 9, height = 6, dpi = 150)
+print(plot_alpha)
+
+library(invgamma)  # for dinvgamma; already used elsewhere in the Rmd
+
+kappa_list <- list(
+  `DPM-Stan`   = kappa_stan,
+  `CRP-NIMBLE` = kappa_nim,
+  Walker       = kappa_walker,
+  `Neal Alg.3` = kappa_alg3
+)
+
+cat("\nPosterior of kappa:\n")
+kappa_summary <- do.call(rbind, lapply(names(kappa_list), function(nm) {
+  x <- kappa_list[[nm]]
+  data.frame(method = nm, mean = mean(x), median = median(x),
+             q025 = quantile(x, 0.025), q975 = quantile(x, 0.975))
+}))
+print(kappa_summary, row.names = FALSE, digits = 3)
+
+# Prior hyperparameters (InvGamma shape / scale, matching Stan's inv_gamma(a,b))
+A_KAPPA <- CFG[["A_KAPPA"]]
+B_KAPPA <- CFG[["B_KAPPA"]]
+
+# Long-format data frame of raw posterior draws
+kappa_df <- do.call(rbind, lapply(names(kappa_list), function(nm) {
+  data.frame(method = nm, kappa = as.numeric(kappa_list[[nm]]))
+}))
+kappa_df$method <- factor(kappa_df$method, levels = names(kappa_list))
+
+# Per-method posterior mean of kappa, one row per facet
+kappa_means <- do.call(rbind, lapply(names(kappa_list), function(nm) {
+  data.frame(method = nm, mean_kappa = mean(kappa_list[[nm]]))
+}))
+kappa_means$method <- factor(kappa_means$method, levels = names(kappa_list))
+
+plot_kappa <- ggplot(kappa_df, aes(x = kappa)) +
+   geom_density(aes(colour = "Posterior"),
+                fill = "steelblue", alpha = 0.35, linewidth = 0.7) +
+  stat_function(aes(colour = "Prior"),
+                fun  = dinvgamma,
+                args = list(shape = 5, scale = 70),
+                linewidth = 0.7, linetype = "dashed") +
+  geom_vline(data = kappa_means,
+             aes(xintercept = mean_kappa, colour = "Posterior mean"),
+             linetype = "dotted", linewidth = 0.7,
+             show.legend = FALSE) +
+  geom_text(data = kappa_means,
+            aes(x = mean_kappa, y = Inf,
+                label = sprintf("mean = %.2f", mean_kappa)),
+            hjust = -0.05, vjust = 1.5, size = 3, colour = "grey20",
+            inherit.aes = FALSE) +
+  facet_wrap(~ method, ncol = 2, scales = "free") +
+  scale_colour_manual(values = c("Posterior"      = "steelblue",
+                                 "Prior"          = "firebrick",
+                                 "Posterior mean" = "red"),
+                      breaks = c("Posterior", "Prior", "Posterior mean")) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 6)) +
+  labs(title    = expression("Posterior of " * kappa),
+       subtitle = sprintf("Prior: InvGamma(shape = %g, scale = %g);  red dotted line = posterior mean",
+                          A_KAPPA, B_KAPPA),
+       x        = expression(kappa),
+       y        = "Density",
+       colour   = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom") 
+
+ggsave(file.path(OUT_DIR, "galaxy_kappa.png"), plot_kappa,
+       width = 9, height = 6, dpi = 150)
+print(plot_kappa)
+
+
+
+
+# ---- 11. MCMC diagnostics ----------------------------------------------------
+# Build draws_array (iter x chain x param) for each method, then compute
+# rhat / ess_bulk / ess_tail per parameter via posterior::summarise_draws.
+make_draws_array <- function(alpha_v, kappa_v, K_occ_v, n_chains, keep_per_chain) {
+  arr <- array(NA_real_,
+               dim = c(keep_per_chain, n_chains, 3),
+               dimnames = list(NULL, NULL,
+                               c("alpha", "kappa", "K_occ")))
+  for (c in seq_len(n_chains)) {
+    idx <- ((c - 1) * keep_per_chain + 1):(c * keep_per_chain)
+    arr[, c, "alpha"] <- alpha_v[idx]
+    arr[, c, "kappa"] <- kappa_v[idx]
+    arr[, c, "K_occ"] <- K_occ_v[idx]
+  }
+  posterior::as_draws_array(arr)
+}
+
+method_draws <- list(
+  `DPM-Stan`   = make_draws_array(alpha_stan,   kappa_stan,   K_occ_stan,
+                                  CFG$N_CHAINS, KEEP_PER_CHAIN),
+  `CRP-NIMBLE` = make_draws_array(alpha_nim,    kappa_nim,    K_occ_nim,
+                                  CFG$N_CHAINS, KEEP_PER_CHAIN),
+  Walker       = make_draws_array(alpha_walker, kappa_walker, K_occ_walker,
+                                  CFG$N_CHAINS, KEEP_PER_CHAIN),
+  `Neal Alg.3` = make_draws_array(alpha_alg3,   kappa_alg3,   K_occ_alg3,
+                                  CFG$N_CHAINS, KEEP_PER_CHAIN)
+)
+
+diag_tbl <- do.call(rbind, lapply(names(method_draws), function(nm) {
+  s <- posterior::summarise_draws(method_draws[[nm]])
+  cbind(method = nm, as.data.frame(s))
+}))
+diag_tbl$runtime_sec <- c(
+  rep(stan_runtime,   3),
+  rep(nim_runtime,    3),
+  rep(walker_runtime, 3),
+  rep(alg3_runtime,   3)
+)
+diag_tbl$ess_per_sec <- diag_tbl$ess_bulk / diag_tbl$runtime_sec
+
+write.csv(diag_tbl, file.path(OUT_DIR, "galaxy_diagnostics.csv"), row.names = FALSE)
+cat("\nMCMC diagnostics:\n")
+print(diag_tbl, row.names = FALSE, digits = 3)
+
+
+# ---- 11b. Trace plots --------------------------------------------------------
+# One panel per (method, parameter); 4 chains overlaid in different colours.
+color_scheme_set("mix-blue-red")
+
+trace_plots <- function(draws_arr, method_name) {
+  bayesplot::mcmc_trace(draws_arr,
+    pars = c("alpha", "kappa", "K_occ"),
+    facet_args = list(ncol = 1, strip.position = "left")) +
+    ggtitle(method_name) +
+    theme_minimal(base_size = 10)
+}
+
+for (nm in names(method_draws)) {
+  p <- trace_plots(method_draws[[nm]], nm)
+  fname <- paste0("galaxy_trace_",
+                  gsub("[^A-Za-z0-9]+", "_", nm), ".png")
+  ggsave(file.path(OUT_DIR, fname), p,
+         width = 8, height = 7, dpi = 150)
+}
+
+# A combined diagnostic dashboard: rank histograms for K_occ (mixing across chains)
+rank_plots <- lapply(names(method_draws), function(nm) {
+  bayesplot::mcmc_rank_overlay(method_draws[[nm]],
+    pars = c("alpha", "kappa", "K_occ")) +
+    ggtitle(nm) + theme_minimal(base_size = 9)
+})
+plot_ranks <- wrap_plots(rank_plots, ncol = 2) +
+  plot_annotation(title = "Rank-overlay diagnostics across chains",
+                  subtitle = "Uniform → chains mixing; bumps/skews → poor mixing")
+ggsave(file.path(OUT_DIR, "galaxy_rank_overlay.png"), plot_ranks,
+       width = 12, height = 9, dpi = 150)
+
+
+# ---- 12. Persist results -----------------------------------------------------
+saveRDS(list(
+  cfg            = CFG,
+  grid           = grid,
+  y_data         = y_data,
+  bands          = bands_list,
+  K_occ          = K_occ_list,
+  K_summary      = K_summary,
+  diag_table     = diag_tbl,
+  draws_alpha    = list(`DPM-Stan` = alpha_stan, `CRP-NIMBLE` = alpha_nim,
+                        Walker = alpha_walker, `Neal Alg.3` = alpha_alg3),
+  draws_kappa    = list(`DPM-Stan` = kappa_stan, `CRP-NIMBLE` = kappa_nim,
+                        Walker = kappa_walker, `Neal Alg.3` = kappa_alg3),
+  runtimes_sec   = c(Stan = stan_runtime, NIMBLE = nim_runtime,
+                     Walker = walker_runtime, `Alg3` = alg3_runtime)
+), file.path(OUT_DIR, "galaxy_results.rds"))
+
+cat("\nAll outputs written to ", normalizePath(OUT_DIR), "\n", sep = "")
